@@ -148,7 +148,11 @@ impl Book {
     }
     pub async fn update_chapter_content(&mut self) -> eyre::Result<()> {
         let num_chapters = self.chapters.len();
+        // Select the chapter-inner and chapter-content div.
         let content_selector = Selector::parse(".chapter-inner.chapter-content").unwrap();
+
+        // Select all elements within the content that are not divs with a class (they are the stolen messages).
+        let not_stolen_selector = Selector::parse(":scope > :not(div[class])").unwrap();
 
         // Strange selectors are because RR doesn't have a way to tell if the author's note is
         // at the start or the end in the HTML.
@@ -173,12 +177,18 @@ impl Book {
 
             let parsed = Html::parse_document(&text);
 
-            // Parse content.
+            // First select content with the content selector.
             let content = parsed
                 .select(&content_selector)
                 .next()
-                .ok_or(eyre::eyre!("No content found"))?
-                .inner_html();
+                .ok_or(eyre::eyre!("No content found"))?;
+
+            // Then pull out non-stolen items.
+            let content = content
+                .select(&not_stolen_selector)
+                .map(|v| v.html())
+                .collect::<Vec<_>>()
+                .join("\n");
             chapter.content = Some(content);
 
             // Parse starting AN.
@@ -430,13 +440,6 @@ fn chapter_html(chapter: &Chapter, file: &mut impl Write) -> eyre::Result<()> {
         // Remove overflow: auto.
         let overflow_regex = Regex::new(r#"overflow:\s?auto"#).unwrap();
         content = overflow_regex.replace_all(&content, "").to_string();
-
-        // Remove any "stolen from Amazon" messages.
-        // Please don't use this tool to re-publish authors' works without their permission.
-        let messages = include_str!("./assets/messages.txt");
-        for message in messages.split('\n') {
-            content = content.replace(message, "");
-        }
 
         write_elements(
             &mut xml,

@@ -105,7 +105,6 @@ async fn download(global_args: GlobalArgs, args: DownloadArgs) -> eyre::Result<(
 }
 async fn update(global_args: GlobalArgs, args: UpdateArgs) -> eyre::Result<()> {
     let api = RoyalRoadApi::new();
-
     let Ok(stat) = std::fs::metadata(&args.folder_or_file) else {
         tracing::error!(
             "Folder or file \"{}\" does not exist, aborting.",
