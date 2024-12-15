@@ -10,7 +10,7 @@ A small application to convert a [Royal Road](https://www.royalroad.com/) story 
 This tool is written in Rust. To install it, first install [Rust](https://www.rust-lang.org/tools/install), then run the following command:
 
 ```
-cargo install --git https://github.com/isaac-mcfadyen/rr-to-epub
+cargo install --locked --git https://github.com/isaac-mcfadyen/rr-to-epub
 ```
 
 ## Usage
