@@ -2,6 +2,8 @@
 name = "rr-to-epub"
 version = "0.1.0"
 edition = "2021"
+authors = ["Isaac McFadyen <isaac@imcf.me>"]
+description = "Convert Royal Road books into EPUB format"
 
 [dependencies]
 eyre = "0.6.12"

@@ -46,6 +46,7 @@ pub enum Command {
 }
 
 #[derive(Debug, Parser)]
+#[clap(about, version, author)]
 pub struct App {
     #[clap(subcommand)]
     command: Command,
