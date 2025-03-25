@@ -162,7 +162,11 @@ impl Book {
         // Check for existing progress
         let start_index = Cache::read_download_progress(self)?.unwrap_or(0);
         if start_index > 0 {
-            tracing::info!("Resuming download from chapter {} of {}", start_index + 1, num_chapters);
+            tracing::info!(
+                "Resuming download from chapter {} of {}",
+                start_index + 1,
+                num_chapters
+            );
         }
 
         let mut current_index = start_index;
@@ -217,14 +221,18 @@ impl Book {
 
             // Save progress every 100 chapters
             if (current_index + 1) % 100 == 0 {
-                tracing::info!("Saving checkpoint at chapter {} of {}", current_index + 1, num_chapters);
+                tracing::info!(
+                    "Saving checkpoint at chapter {} of {}",
+                    current_index + 1,
+                    num_chapters
+                );
                 Cache::save_download_progress(self, current_index + 1)?;
                 Cache::write_book(self)?;
             }
 
             // Sleep for 0.5 seconds to avoid rate limiting.
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            
+
             current_index += 1;
         }
 
@@ -862,7 +870,7 @@ async fn download_image(book: &Book, url: String, file: &mut impl Write) -> eyre
                     return Ok(());
                 }
             };
-            
+
             if !image.status().is_success() {
                 tracing::warn!(
                     "Failed to download image from URL (HTTP {}): {}. This is likely NOT a bug with rr-to-epub.",

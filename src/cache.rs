@@ -66,7 +66,7 @@ impl Cache {
     pub fn save_download_progress(book: &Book, last_processed_index: usize) -> eyre::Result<()> {
         let cache_dir = Self::cache_path()?.join(book.id.to_string());
         std::fs::create_dir_all(&cache_dir)?;
-        
+
         let progress_file = cache_dir.join("download_progress.json");
         let progress = serde_json::to_string(&last_processed_index)?;
         std::fs::write(progress_file, progress)?;
@@ -75,7 +75,9 @@ impl Cache {
 
     pub fn read_download_progress(book: &Book) -> eyre::Result<Option<usize>> {
         let cache_dir = Self::cache_path()?;
-        let progress_file = cache_dir.join(book.id.to_string()).join("download_progress.json");
+        let progress_file = cache_dir
+            .join(book.id.to_string())
+            .join("download_progress.json");
         if !progress_file.exists() {
             return Ok(None);
         }
