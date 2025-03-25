@@ -158,11 +158,24 @@ impl Book {
         // at the start or the end in the HTML.
         let authors_note_start_selector = Selector::parse("hr + .portlet > .author-note").unwrap();
         let authors_note_end_selector = Selector::parse("div + .portlet > .author-note").unwrap();
-        for (index, chapter) in self.chapters.iter_mut().enumerate() {
+
+        // Check for existing progress
+        let start_index = Cache::read_download_progress(self)?.unwrap_or(0);
+        if start_index > 0 {
+            tracing::info!(
+                "Resuming download from chapter {} of {}",
+                start_index + 1,
+                num_chapters
+            );
+        }
+
+        let mut current_index = start_index;
+        while current_index < num_chapters {
+            let chapter = &mut self.chapters[current_index];
             tracing::info!(
                 "Downloading chapter '{}' ({} of {})",
                 chapter.title,
-                index + 1,
+                current_index + 1,
                 num_chapters
             );
             let url = format!("https://www.royalroad.com{}", chapter.url);
@@ -206,9 +219,30 @@ impl Book {
                 }
             }
 
+            // Save progress every 100 chapters
+            if (current_index + 1) % 100 == 0 {
+                tracing::info!(
+                    "Saving checkpoint at chapter {} of {}",
+                    current_index + 1,
+                    num_chapters
+                );
+                Cache::save_download_progress(self, current_index + 1)?;
+                Cache::write_book(self)?;
+            }
+
             // Sleep for 0.5 seconds to avoid rate limiting.
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+            current_index += 1;
         }
+
+        // Clear the progress file when done
+        let cache_dir = Cache::cache_path()?.join(self.id.to_string());
+        let progress_file = cache_dir.join("download_progress.json");
+        if progress_file.exists() {
+            std::fs::remove_file(progress_file)?;
+        }
+
         Ok(())
     }
 }
@@ -819,15 +853,28 @@ async fn download_image(book: &Book, url: String, file: &mut impl Write) -> eyre
         }
         None => {
             let client = reqwest::Client::new();
-            let image = client
+            let image = match client
                 .get(&url)
                 .header("User-Agent", USER_AGENT)
                 .send()
-                .await?;
+                .await
+            {
+                Ok(response) => response,
+                Err(e) => {
+                    // Handle DNS and connection errors gracefully
+                    tracing::warn!(
+                        "Failed to download image from URL ({}): {}. This is likely NOT a bug with rr-to-epub.",
+                        url,
+                        e
+                    );
+                    return Ok(());
+                }
+            };
+
             if !image.status().is_success() {
-                // Ignore failed images.
                 tracing::warn!(
-                    "Failed to download image from URL. This is likely NOT a bug with rr-to-epub. URL: {}",
+                    "Failed to download image from URL (HTTP {}): {}. This is likely NOT a bug with rr-to-epub.",
+                    image.status(),
                     url
                 );
                 return Ok(());
