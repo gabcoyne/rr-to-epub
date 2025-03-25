@@ -5,8 +5,6 @@ on:
     branches: [ main ]
   pull_request:
     branches: [ main ]
-  release:
-    types: [published]
 
 env:
   CARGO_TERM_COLOR: always
@@ -37,90 +35,3 @@ jobs:
       
       - name: Run rustfmt
         run: cargo fmt -- --check
-
-  release:
-    name: Release
-    needs: build
-    runs-on: ubuntu-latest
-    if: github.event_name == 'release' && github.event.action == 'published'
-    
-    steps:
-      - uses: actions/checkout@v4
-      
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustup
-      
-      - name: Build for Linux
-        run: |
-          cargo build --release --target x86_64-unknown-linux-gnu
-          cargo build --release --target aarch64-unknown-linux-gnu
-      
-      - name: Build for macOS
-        run: |
-          cargo build --release --target x86_64-apple-darwin
-          cargo build --release --target aarch64-apple-darwin
-      
-      - name: Build for Windows
-        run: |
-          cargo build --release --target x86_64-pc-windows-gnu
-      
-      - name: Create release archive
-        run: |
-          mkdir -p dist
-          tar -czf dist/rr-to-epub-linux-x86_64.tar.gz -C target/x86_64-unknown-linux-gnu/release rr-to-epub
-          tar -czf dist/rr-to-epub-linux-aarch64.tar.gz -C target/aarch64-unknown-linux-gnu/release rr-to-epub
-          tar -czf dist/rr-to-epub-macos-x86_64.tar.gz -C target/x86_64-apple-darwin/release rr-to-epub
-          tar -czf dist/rr-to-epub-macos-aarch64.tar.gz -C target/aarch64-apple-darwin/release rr-to-epub
-          zip -j dist/rr-to-epub-windows-x86_64.zip target/x86_64-pc-windows-gnu/release/rr-to-epub.exe
-      
-      - name: Upload release assets
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ github.event.release.upload_url }}
-          asset_path: ./dist/rr-to-epub-linux-x86_64.tar.gz
-          asset_name: rr-to-epub-linux-x86_64.tar.gz
-          asset_content_type: application/gzip
-      
-      - name: Upload release assets
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ github.event.release.upload_url }}
-          asset_path: ./dist/rr-to-epub-linux-aarch64.tar.gz
-          asset_name: rr-to-epub-linux-aarch64.tar.gz
-          asset_content_type: application/gzip
-      
-      - name: Upload release assets
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ github.event.release.upload_url }}
-          asset_path: ./dist/rr-to-epub-macos-x86_64.tar.gz
-          asset_name: rr-to-epub-macos-x86_64.tar.gz
-          asset_content_type: application/gzip
-      
-      - name: Upload release assets
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ github.event.release.upload_url }}
-          asset_path: ./dist/rr-to-epub-macos-aarch64.tar.gz
-          asset_name: rr-to-epub-macos-aarch64.tar.gz
-          asset_content_type: application/gzip
-      
-      - name: Upload release assets
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ github.event.release.upload_url }}
-          asset_path: ./dist/rr-to-epub-windows-x86_64.zip
-          asset_name: rr-to-epub-windows-x86_64.zip
-          asset_content_type: application/zip 
