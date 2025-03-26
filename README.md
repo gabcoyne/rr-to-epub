@@ -7,16 +7,6 @@ A small application to convert a [Royal Road](https://www.royalroad.com/) story 
 
 ## Installation
 
-### From Pre-built Binaries
-
-Pre-built binaries are available for various platforms in the [GitHub Releases](https://github.com/isaac-mcfadyen/rr-to-epub/releases) page:
-
-- Linux (x86_64 and aarch64)
-- macOS (x86_64 and aarch64)
-- Windows (x86_64)
-
-Download the appropriate archive for your platform and extract it. The binary will be named `rr-to-epub` (or `rr-to-epub.exe` on Windows).
-
 ### From Source
 
 This tool is written in Rust. To install it from source, first install [Rust](https://www.rust-lang.org/tools/install), then run the following command:
@@ -24,6 +14,8 @@ This tool is written in Rust. To install it from source, first install [Rust](ht
 ```sh
 cargo install --locked --git https://github.com/isaac-mcfadyen/rr-to-epub
 ```
+
+Prebuilt binaries are not currently available. 
 
 ## Usage
 
@@ -40,37 +32,6 @@ rr-to-epub update -d <directory>
 ```
 
 Full help can be found by running `rr-to-epub --help`.
-
-## Development
-
-### Building from Source
-
-1. Clone the repository:
-   ```sh
-   git clone https://github.com/isaac-mcfadyen/rr-to-epub.git
-   cd rr-to-epub
-   ```
-
-2. Build the project:
-   ```sh
-   cargo build --release
-   ```
-
-3. Run tests:
-   ```sh
-   cargo test
-   ```
-
-### CI
-
-This project uses GitHub Actions for continuous integration:
-
-- On every push to main and pull requests:
-  - Builds the project
-  - Runs tests
-  - Checks code formatting with rustfmt
-  - Runs clippy for linting
-
 
 ## License
 
