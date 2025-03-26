@@ -61,9 +61,9 @@ Full help can be found by running `rr-to-epub --help`.
    cargo test
    ```
 
-### CI/CD
+### CI
 
-This project uses GitHub Actions for continuous integration and deployment:
+This project uses GitHub Actions for continuous integration:
 
 - On every push to main and pull requests:
   - Builds the project
@@ -71,10 +71,6 @@ This project uses GitHub Actions for continuous integration and deployment:
   - Checks code formatting with rustfmt
   - Runs clippy for linting
 
-- On release publication:
-  - Builds binaries for all supported platforms
-  - Creates release archives
-  - Uploads the archives to GitHub Releases
 
 ## License
 
