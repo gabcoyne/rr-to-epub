@@ -32,17 +32,24 @@ cover {
 	width: 100%;
 	height: 100%;
 }
-.authors-note-start {
-	padding-left: 20px;
-	padding-top: 10px;
-	padding-bottom: 10px;
-	font-style: italic;
-	font-size: 0.8em;
-}
+.authors-note-start,
 .authors-note-end {
-	padding-left: 20px;
-	padding-top: 10px;
-	padding-bottom: 10px;
+	display: block;
+	margin: 1.2em 0;
+	padding: 10px 16px 10px 20px;
+	border-left: 3px solid #888;
 	font-style: italic;
+	font-size: 0.9em;
+}
+.authors-note-label {
+	margin: 0 0 0.4em 0;
+	font-style: normal;
+	font-weight: bold;
 	font-size: 0.8em;
+	letter-spacing: 0.06em;
+	text-transform: uppercase;
+}
+.authors-note-caption {
+	font-style: normal;
+	font-weight: bold;
 }
