@@ -1,4 +1,7 @@
 use crate::cache::Cache;
+use crate::clean::{hidden_classes, strip_piracy};
+use crate::http::{polite_delay, HttpClient};
+use crate::range::RangeRequest;
 use crate::xml_ext::write_elements;
 use eyre::bail;
 use image::codecs::jpeg::JpegEncoder;
@@ -7,6 +10,7 @@ use image::io::Reader;
 use regex::Regex;
 use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::io::Read;
 use std::io::{Cursor, Write};
 use std::path::PathBuf;
@@ -16,7 +20,12 @@ use webp::Decoder;
 use xml::writer::XmlEvent;
 use xml::EmitterConfig;
 
-const USER_AGENT: &str = "rr-to-epub <https://github.com/isaac-mcfadyen/rr-to-epub>";
+/// Where an existing EPUB came from, including an optional chapter slice.
+#[derive(Clone, Debug, Default)]
+pub struct EpubOrigin {
+    pub id: Option<u32>,
+    pub range: RangeRequest,
+}
 
 #[derive(Default, Clone, Debug, Serialize, Deserialize)]
 pub struct Book {
@@ -27,223 +36,232 @@ pub struct Book {
     pub date_published: String,
     pub cover_url: String,
     pub cover: Option<Vec<u8>>,
+    /// MIME type of `cover` bytes. Empty means sniff the bytes when writing.
+    #[serde(default)]
+    pub cover_media_type: String,
     pub chapters: Vec<Chapter>,
 
+    /// Royal Road id of the first chapter in a partial EPUB. Unset for a full book.
     #[serde(skip)]
-    client: reqwest::Client,
+    pub range_start_id: Option<u32>,
+    /// Royal Road id of the last chapter when the end is pinned. Unset when the end is "latest".
+    #[serde(skip)]
+    pub range_end_id: Option<u32>,
+    /// The slice runs through whatever the latest chapter is at download time.
+    #[serde(skip)]
+    pub range_end_latest: bool,
+
+    #[serde(skip)]
+    client: HttpClient,
 }
 impl Book {
-    pub fn id_from_file(path: PathBuf) -> eyre::Result<Option<u32>> {
-        // Open the file as a ZIP.
-        let mut reader = zip::ZipArchive::new(std::fs::File::open(path)?)?;
-
-        // Open the file at OEBPS/content.opf.
+    pub fn origin_from_file(path: impl Into<PathBuf>) -> eyre::Result<EpubOrigin> {
+        let mut reader = zip::ZipArchive::new(std::fs::File::open(path.into())?)?;
         let mut content_opf = reader.by_name("OEBPS/content.opf")?;
-
-        // Read the file.
         let mut contents = String::new();
         content_opf.read_to_string(&mut contents)?;
 
-        // Parse as XML.
-        let mut parsed = xml::EventReader::new(contents.as_bytes());
-        loop {
-            let Ok(event) = parsed.next() else {
-                return Ok(None);
-            };
-            match event {
-                xml::reader::XmlEvent::StartElement { attributes, .. } => {
-                    let is_rr_tag = attributes.iter().any(|v| {
-                        v.name.local_name == "name" && v.value == "rr-to-epub:royal-road-id"
-                    });
-                    if is_rr_tag {
-                        // Find the content attribute.
-                        let Some(content) =
-                            attributes.iter().find(|v| v.name.local_name == "content")
-                        else {
-                            return Ok(None);
-                        };
+        let mut origin = EpubOrigin::default();
+        let mut start_id: Option<u32> = None;
+        let mut end_id: Option<u32> = None;
+        let mut end_latest = false;
 
-                        let id = content.value.parse::<u32>()?;
-                        return Ok(Some(id));
-                    }
+        let mut parsed = xml::EventReader::new(contents.as_bytes());
+        while let Ok(event) = parsed.next() {
+            let xml::reader::XmlEvent::StartElement { attributes, .. } = event else {
+                if matches!(event, xml::reader::XmlEvent::EndDocument) {
+                    break;
                 }
-                xml::reader::XmlEvent::EndDocument => {
-                    // End of document without finding the ID.
-                    return Ok(None);
-                }
+                continue;
+            };
+            let name = attributes
+                .iter()
+                .find(|attribute| attribute.name.local_name == "name")
+                .map(|attribute| attribute.value.as_str());
+            let content = attributes
+                .iter()
+                .find(|attribute| attribute.name.local_name == "content")
+                .map(|attribute| attribute.value.as_str());
+            let Some((name, content)) = name.zip(content) else {
+                continue;
+            };
+            match name {
+                "rr-to-epub:royal-road-id" => origin.id = content.parse().ok(),
+                "rr-to-epub:range-start-id" => start_id = content.parse().ok(),
+                "rr-to-epub:range-end-id" => end_id = content.parse().ok(),
+                "rr-to-epub:range-end-latest" => end_latest = content == "true",
                 _ => {}
             }
         }
+
+        if let Some(start) = start_id {
+            origin.range = RangeRequest {
+                from: Some(format!("id:{start}")),
+                to: if end_latest {
+                    None
+                } else {
+                    end_id.map(|id| format!("id:{id}"))
+                },
+                after: None,
+            };
+        }
+        Ok(origin)
     }
-    pub async fn new(id: u32) -> eyre::Result<Self> {
-        // Cover in script tag: window.fictionCover = "...";
-        let cover_regex = Regex::new(r#"window\.fictionCover = "(.*)";"#).unwrap();
-        // Chapters array in script tag: window.chapters = [...];
-        let chapters_regex = Regex::new(r#"window\.chapters = (\[.*]);"#).unwrap();
-        let client = reqwest::Client::new();
 
-        let request = client
-            .get(format!("https://www.royalroad.com/fiction/{}", id))
-            .header("User-Agent", USER_AGENT)
-            .send()
-            .await?
-            .error_for_status()?;
-        let response = request.text().await?;
-
-        // Parse book metadata.
+    pub async fn new(client: HttpClient, id: u32) -> eyre::Result<Self> {
+        let url = format!("https://www.royalroad.com/fiction/{id}");
+        let response = client.get_html(&url, None).await?;
         let parsed = Html::parse_document(&response);
-        let title_selector = Selector::parse("h1").unwrap();
-        let author_selector = Selector::parse("h4 a").unwrap();
-        let description_selector = Selector::parse(".description > .hidden-content").unwrap();
-        let title = parsed
-            .select(&title_selector)
-            .next()
-            .ok_or(eyre::eyre!("No title found"))?
-            .inner_html();
-        let author = parsed
-            .select(&author_selector)
-            .next()
-            .ok_or(eyre::eyre!("No author found"))?
-            .inner_html();
-        let description = parsed
-            .select(&description_selector)
-            .next()
-            .ok_or(eyre::eyre!("No description found"))?
-            .inner_html();
+        let json_ld = json_ld_book(&response);
 
-        // Parse chapter metadata.
+        let title = text_of(&parsed, "h1")
+            .or_else(|| json_ld_string(&json_ld, "name"))
+            .ok_or_else(|| eyre::eyre!("No title found"))?;
+        let author = text_of(&parsed, "h4 a")
+            .or_else(|| meta_content(&parsed, "books:author"))
+            .or_else(|| {
+                json_ld.as_ref().and_then(|value| {
+                    value
+                        .get("author")
+                        .and_then(|author| author.get("name"))
+                        .and_then(|name| name.as_str())
+                        .map(str::trim)
+                        .filter(|name| !name.is_empty())
+                        .map(str::to_string)
+                })
+            })
+            .ok_or_else(|| eyre::eyre!("No author found"))?;
+        let description = html_of(&parsed, ".description > .hidden-content")
+            .or_else(|| json_ld_string(&json_ld, "description"))
+            .ok_or_else(|| eyre::eyre!("No description found"))?;
+
+        let cover_regex = Regex::new(r#"window\.fictionCover = "(.*)";"#).unwrap();
         let cover = cover_regex
             .captures(&response)
-            .ok_or(eyre::eyre!("No cover found"))?[1]
-            .to_string();
-        let chapters = chapters_regex
-            .captures(&response)
-            .ok_or(eyre::eyre!("No chapters found"))?[1]
-            .to_string();
-        let chapters: Vec<Chapter> = serde_json::from_str(&chapters)?;
+            .map(|captures| captures[1].to_string())
+            .or_else(|| json_ld_string(&json_ld, "image"))
+            .or_else(|| meta_content(&parsed, "og:image"))
+            .ok_or_else(|| eyre::eyre!("No cover found"))?;
+
+        let chapters = parse_chapters(&response)?;
+        if chapters.is_empty() {
+            bail!("Fiction {id} has no chapters");
+        }
 
         Ok(Self {
             id,
             cover_url: cover,
             cover: None,
+            cover_media_type: String::new(),
             title,
             author,
             description,
-            date_published: chapters.first().unwrap().date.clone(),
+            date_published: chapters[0].date.clone(),
             chapters,
+            range_start_id: None,
+            range_end_id: None,
+            range_end_latest: false,
             client,
         })
     }
+
+    /// Download the largest cover variant that responds, without resizing it.
     pub async fn update_cover(&mut self) -> eyre::Result<()> {
-        let cover = self
-            .client
-            .get(&self.cover_url)
-            .header("User-Agent", USER_AGENT)
-            .send()
-            .await?
-            .error_for_status()?;
-        let bytes = cover.bytes().await?;
-        self.cover = Some(bytes.to_vec());
+        let referer = format!("https://www.royalroad.com/fiction/{}", self.id);
+        let mut best: Option<(Vec<u8>, String)> = None;
+        for url in cover_candidate_urls(&self.cover_url) {
+            match self.client.get_bytes(&url, Some(&referer)).await {
+                Ok(bytes) if sniff_image_type(&bytes).is_some() || is_webp(&bytes) => {
+                    let replace = best
+                        .as_ref()
+                        .map(|(existing, _)| bytes.len() > existing.len())
+                        .unwrap_or(true);
+                    if replace {
+                        tracing::info!("Cover candidate {} ({} bytes)", url, bytes.len());
+                        best = Some((bytes, url));
+                    }
+                }
+                Ok(_) => tracing::warn!("Cover candidate was not an image: {url}"),
+                Err(err) => tracing::warn!("Cover candidate failed ({url}): {err}"),
+            }
+        }
+        let (bytes, url) = best.ok_or_else(|| eyre::eyre!("No cover image could be downloaded"))?;
+        let (bytes, media_type) = normalize_cover(bytes)?;
+        tracing::info!("Using cover {url} as {media_type} ({} bytes)", bytes.len());
+        self.cover_media_type = media_type.to_string();
+        self.cover = Some(bytes);
         Ok(())
     }
-    pub async fn update_chapter_content(&mut self) -> eyre::Result<()> {
-        let num_chapters = self.chapters.len();
-        // Select the chapter-inner and chapter-content div.
-        let content_selector = Selector::parse(".chapter-inner.chapter-content").unwrap();
 
-        // Select all elements within the content that are not divs with a class (they are the stolen messages).
-        let not_stolen_selector = Selector::parse(":scope > :not(div[class])").unwrap();
-
-        // Strange selectors are because RR doesn't have a way to tell if the author's note is
-        // at the start or the end in the HTML.
-        let authors_note_start_selector = Selector::parse("hr + .portlet > .author-note").unwrap();
-        let authors_note_end_selector = Selector::parse("div + .portlet > .author-note").unwrap();
-
-        // Check for existing progress
-        let start_index = Cache::read_download_progress(self)?.unwrap_or(0);
-        if start_index > 0 {
-            tracing::info!(
-                "Resuming download from chapter {} of {}",
-                start_index + 1,
-                num_chapters
+    /// Fill chapter bodies for the inclusive TOC slice `start..=end`.
+    ///
+    /// Chapters that already have content are left alone, so a range download
+    /// can resume from the on-disk cache without walking the whole fiction.
+    pub async fn update_chapter_content(&mut self, start: usize, end: usize) -> eyre::Result<()> {
+        if self.chapters.is_empty() {
+            bail!("Fiction has no chapters");
+        }
+        if start > end || end >= self.chapters.len() {
+            bail!(
+                "Chapter slice {start}..={end} is outside 0..{}",
+                self.chapters.len()
             );
         }
 
-        let mut current_index = start_index;
-        while current_index < num_chapters {
-            let chapter = &mut self.chapters[current_index];
-            tracing::info!(
-                "Downloading chapter '{}' ({} of {})",
-                chapter.title,
-                current_index + 1,
-                num_chapters
-            );
-            let url = format!("https://www.royalroad.com{}", chapter.url);
-            let request = self
-                .client
-                .get(url)
-                .header("User-Agent", USER_AGENT)
-                .send()
-                .await?
-                .error_for_status()?;
-            let text = request.text().await?;
-
-            let parsed = Html::parse_document(&text);
-
-            // First select content with the content selector.
-            let content = parsed
-                .select(&content_selector)
-                .next()
-                .ok_or(eyre::eyre!("No content found"))?;
-
-            // Then pull out non-stolen items.
-            let content = content
-                .select(&not_stolen_selector)
-                .map(|v| v.html())
-                .collect::<Vec<_>>()
-                .join("\n");
-            chapter.content = Some(content);
-
-            // Parse starting AN.
-            if let Some(authors_note) = parsed.select(&authors_note_start_selector).next() {
-                let authors_note = authors_note.inner_html();
-                if !authors_note.is_empty() {
-                    chapter.authors_note_start = Some(authors_note);
-                }
-            }
-            // Parse ending AN.
-            if let Some(authors_note) = parsed.select(&authors_note_end_selector).next() {
-                let authors_note = authors_note.inner_html();
-                if !authors_note.is_empty() {
-                    chapter.authors_note_end = Some(authors_note);
-                }
-            }
-
-            // Save progress every 100 chapters
-            if (current_index + 1) % 100 == 0 {
+        let total = end - start + 1;
+        let mut downloaded = 0usize;
+        for index in start..=end {
+            let position = index - start + 1;
+            if self.chapters[index].content.is_some() {
                 tracing::info!(
-                    "Saving checkpoint at chapter {} of {}",
-                    current_index + 1,
-                    num_chapters
+                    "Using cached chapter '{}' ({position} of {total})",
+                    self.chapters[index].title
                 );
-                Cache::save_download_progress(self, current_index + 1)?;
+                continue;
+            }
+
+            let title = self.chapters[index].title.clone();
+            let path = self.chapters[index].url.clone();
+            tracing::info!("Downloading chapter '{title}' ({position} of {total})");
+            let url = if path.starts_with("http://") || path.starts_with("https://") {
+                path
+            } else {
+                format!("https://www.royalroad.com{path}")
+            };
+            let referer = format!("https://www.royalroad.com/fiction/{}", self.id);
+            let text = self.client.get_html(&url, Some(&referer)).await?;
+            let parts = extract_chapter_parts(&text)?;
+            let chapter = &mut self.chapters[index];
+            chapter.content = Some(parts.content);
+            chapter.authors_note_start = parts.authors_note_start;
+            chapter.authors_note_end = parts.authors_note_end;
+
+            downloaded += 1;
+            if downloaded.is_multiple_of(20) {
+                tracing::info!("Saving checkpoint after {downloaded} new chapters");
                 Cache::write_book(self)?;
             }
-
-            // Sleep for 0.5 seconds to avoid rate limiting.
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-            current_index += 1;
+            if index != end {
+                polite_delay().await;
+            }
         }
 
-        // Clear the progress file when done
-        let cache_dir = Cache::cache_path()?.join(self.id.to_string());
-        let progress_file = cache_dir.join("download_progress.json");
+        let progress_file = Cache::cache_path()?
+            .join(self.id.to_string())
+            .join("download_progress.json");
         if progress_file.exists() {
-            std::fs::remove_file(progress_file)?;
+            let _ = std::fs::remove_file(progress_file);
         }
-
         Ok(())
+    }
+
+    pub fn cover_filename(&self) -> String {
+        match self.cover_media_type.as_str() {
+            "image/png" => "cover.png".to_string(),
+            "image/gif" => "cover.gif".to_string(),
+            "image/webp" => "cover.webp".to_string(),
+            _ => "cover.jpg".to_string(),
+        }
     }
 }
 
@@ -331,12 +349,17 @@ pub async fn write_epub(book: &Book, outfile: Option<String>) -> eyre::Result<()
         }
     }
 
-    // Write the cover.
+    // Write the cover from the bytes chosen in update_cover (largest variant, not resized).
+    let cover_name = book.cover_filename();
+    let cover_bytes = book
+        .cover
+        .clone()
+        .ok_or_else(|| eyre::eyre!("Book is missing embedded cover bytes"))?;
     epub_file.start_file(
-        "OEBPS/images/cover.jpeg",
+        format!("OEBPS/images/{cover_name}"),
         zip::write::FileOptions::default(),
     )?;
-    download_image(book, book.cover_url.clone(), &mut epub_file).await?;
+    epub_file.write_all(&cover_bytes)?;
 
     // Write the title page.
     epub_file.start_file("OEBPS/text/title.xhtml", zip::write::FileOptions::default())?;
@@ -364,6 +387,7 @@ fn stylesheet(file: &mut impl Write) -> eyre::Result<()> {
 }
 
 fn title_html(book: &Book, file: &mut impl Write) -> eyre::Result<()> {
+    let cover_src = format!("../images/{}", book.cover_filename());
     let mut xml = EmitterConfig::new()
         .perform_indent(true)
         .create_writer(file);
@@ -389,7 +413,7 @@ fn title_html(book: &Book, file: &mut impl Write) -> eyre::Result<()> {
             XmlEvent::start_element("body").into(),
             // Write the cover.
             XmlEvent::start_element("img")
-                .attr("src", "../images/cover.jpeg")
+                .attr("src", &cover_src)
                 .attr("alt", "Cover")
                 .attr("class", "cover")
                 .into(),
@@ -446,17 +470,13 @@ fn chapter_html(chapter: &Chapter, file: &mut impl Write) -> eyre::Result<()> {
         ],
     )?;
 
+    let hidden = HashSet::new();
     // Write the starting author's note, if any.
     if let Some(authors_note_start) = chapter.authors_note_start.clone() {
-        write_elements(
+        write_author_note(
             &mut xml,
-            vec![
-                XmlEvent::start_element("div")
-                    .attr("class", "authors-note-start")
-                    .into(),
-                XmlEvent::characters(&rewrite_images(authors_note_start)?),
-                XmlEvent::end_element().into(),
-            ],
+            "authors-note-start",
+            &rewrite_images(strip_piracy(&authors_note_start, &hidden))?,
         )?;
     }
     // Write the content.
@@ -474,6 +494,7 @@ fn chapter_html(chapter: &Chapter, file: &mut impl Write) -> eyre::Result<()> {
         // Remove overflow: auto.
         let overflow_regex = Regex::new(r#"overflow:\s?auto"#).unwrap();
         content = overflow_regex.replace_all(&content, "").to_string();
+        content = strip_piracy(&content, &hidden);
 
         write_elements(
             &mut xml,
@@ -489,15 +510,10 @@ fn chapter_html(chapter: &Chapter, file: &mut impl Write) -> eyre::Result<()> {
     }
     // Write the ending author's note, if any.
     if let Some(authors_note_end) = chapter.authors_note_end.clone() {
-        write_elements(
+        write_author_note(
             &mut xml,
-            vec![
-                XmlEvent::start_element("div")
-                    .attr("class", "authors-note-end")
-                    .into(),
-                XmlEvent::characters(&rewrite_images(authors_note_end)?),
-                XmlEvent::end_element().into(),
-            ],
+            "authors-note-end",
+            &rewrite_images(strip_piracy(&authors_note_end, &hidden))?,
         )?;
     }
 
@@ -510,6 +526,33 @@ fn chapter_html(chapter: &Chapter, file: &mut impl Write) -> eyre::Result<()> {
         ],
     )?;
     Ok(())
+}
+
+fn write_author_note(
+    xml: &mut xml::EventWriter<&mut impl Write>,
+    class: &str,
+    html: &str,
+) -> eyre::Result<()> {
+    write_elements(
+        xml,
+        vec![
+            XmlEvent::start_element("aside")
+                .attr("class", class)
+                .attr("role", "note")
+                .into(),
+            XmlEvent::start_element("p")
+                .attr("class", "authors-note-label")
+                .into(),
+            XmlEvent::characters("Author's Note"),
+            XmlEvent::end_element().into(),
+            XmlEvent::characters(html),
+            XmlEvent::end_element().into(),
+        ],
+    )
+}
+
+fn chapter_item_id(id: u32) -> String {
+    format!("ch-{id}")
 }
 
 fn container_xml(_: &Book, file: &mut impl Write) -> eyre::Result<()> {
@@ -541,6 +584,20 @@ fn content_opf(book: &Book, file: &mut impl Write) -> eyre::Result<()> {
     let mut xml = EmitterConfig::new()
         .perform_indent(true)
         .create_writer(file);
+    let cover_href = format!("images/{}", book.cover_filename());
+    let cover_type = if book.cover_media_type.is_empty() {
+        "image/jpeg".to_string()
+    } else {
+        book.cover_media_type.clone()
+    };
+    let fiction_id = book.id.to_string();
+    let range_start = book.range_start_id.map(|id| id.to_string());
+    let range_end = book.range_end_id.map(|id| id.to_string());
+    let range_latest = if book.range_end_latest {
+        "true"
+    } else {
+        "false"
+    };
     write_elements(
         &mut xml,
         vec![
@@ -584,9 +641,43 @@ fn content_opf(book: &Book, file: &mut impl Write) -> eyre::Result<()> {
             XmlEvent::end_element().into(),
             XmlEvent::start_element("meta")
                 .attr("name", "rr-to-epub:royal-road-id")
-                .attr("content", &book.id.to_string())
+                .attr("content", &fiction_id)
                 .into(),
             XmlEvent::end_element().into(),
+        ],
+    )?;
+    if let Some(start) = range_start.as_deref() {
+        write_elements(
+            &mut xml,
+            vec![
+                XmlEvent::start_element("meta")
+                    .attr("name", "rr-to-epub:range-start-id")
+                    .attr("content", start)
+                    .into(),
+                XmlEvent::end_element().into(),
+                XmlEvent::start_element("meta")
+                    .attr("name", "rr-to-epub:range-end-latest")
+                    .attr("content", range_latest)
+                    .into(),
+                XmlEvent::end_element().into(),
+            ],
+        )?;
+        if let Some(end) = range_end.as_deref() {
+            write_elements(
+                &mut xml,
+                vec![
+                    XmlEvent::start_element("meta")
+                        .attr("name", "rr-to-epub:range-end-id")
+                        .attr("content", end)
+                        .into(),
+                    XmlEvent::end_element().into(),
+                ],
+            )?;
+        }
+    }
+    write_elements(
+        &mut xml,
+        vec![
             XmlEvent::end_element().into(),
             // Write the manifest.
             XmlEvent::start_element("manifest").into(),
@@ -597,11 +688,12 @@ fn content_opf(book: &Book, file: &mut impl Write) -> eyre::Result<()> {
                 .attr("media-type", "application/xhtml+xml")
                 .into(),
             XmlEvent::end_element().into(),
-            // Write the cover.
+            // Write the cover. properties="cover-image" is the EPUB 3 cover.
             XmlEvent::start_element("item")
                 .attr("id", "cover")
-                .attr("href", "images/cover.jpeg")
-                .attr("media-type", "image/jpeg")
+                .attr("href", &cover_href)
+                .attr("media-type", &cover_type)
+                .attr("properties", "cover-image")
                 .into(),
             XmlEvent::end_element().into(),
             // Write the stylesheet.
@@ -627,8 +719,8 @@ fn content_opf(book: &Book, file: &mut impl Write) -> eyre::Result<()> {
             &mut xml,
             vec![
                 XmlEvent::start_element("item")
-                    .attr("id", &format!("{}", &chapter.id))
-                    .attr("href", &format!("text/{}.xhtml", &chapter.id))
+                    .attr("id", &chapter_item_id(chapter.id))
+                    .attr("href", &format!("text/{}.xhtml", chapter.id))
                     .attr("media-type", "application/xhtml+xml")
                     .into(),
                 XmlEvent::end_element().into(),
@@ -654,7 +746,7 @@ fn content_opf(book: &Book, file: &mut impl Write) -> eyre::Result<()> {
             &mut xml,
             vec![
                 XmlEvent::start_element("itemref")
-                    .attr("idref", &format!("{}", &chapter.id))
+                    .attr("idref", &chapter_item_id(chapter.id))
                     .into(),
                 XmlEvent::end_element().into(),
             ],
@@ -663,7 +755,17 @@ fn content_opf(book: &Book, file: &mut impl Write) -> eyre::Result<()> {
     write_elements(
         &mut xml,
         vec![
+            // End the spine.
             XmlEvent::end_element().into(),
+            XmlEvent::start_element("guide").into(),
+            XmlEvent::start_element("reference")
+                .attr("type", "cover")
+                .attr("title", "Cover")
+                .attr("href", "text/title.xhtml")
+                .into(),
+            XmlEvent::end_element().into(),
+            XmlEvent::end_element().into(),
+            // End the package.
             XmlEvent::end_element().into(),
         ],
     )?;
@@ -734,7 +836,7 @@ fn toc_ncx(book: &Book, file: &mut impl Write) -> eyre::Result<()> {
             &mut xml,
             vec![
                 XmlEvent::start_element("navPoint")
-                    .attr("id", &format!("{}", &chapter.id))
+                    .attr("id", &chapter_item_id(chapter.id))
                     .attr("playOrder", &format!("{}", index + 1))
                     .into(),
                 XmlEvent::start_element("navLabel").into(),
@@ -743,7 +845,7 @@ fn toc_ncx(book: &Book, file: &mut impl Write) -> eyre::Result<()> {
                 XmlEvent::end_element().into(),
                 XmlEvent::end_element().into(),
                 XmlEvent::start_element("content")
-                    .attr("src", &format!("text/{}.xhtml", &chapter.id))
+                    .attr("src", &format!("text/{}.xhtml", chapter.id))
                     .into(),
                 XmlEvent::end_element().into(),
                 XmlEvent::end_element().into(),
@@ -771,7 +873,7 @@ fn extract_image_name(url: &str) -> eyre::Result<String> {
     Ok(url
         .path_segments()
         .ok_or(eyre::eyre!("Invalid image URL"))?
-        .last()
+        .next_back()
         .ok_or(eyre::eyre!("Invalid image URL"))?
         .to_string())
 }
@@ -852,14 +954,15 @@ async fn download_image(book: &Book, url: String, file: &mut impl Write) -> eyre
             file.write_all(&image)?;
         }
         None => {
-            let client = reqwest::Client::new();
-            let image = match client
-                .get(&url)
-                .header("User-Agent", USER_AGENT)
-                .send()
+            let bytes = match book
+                .client
+                .get_bytes(
+                    &url,
+                    Some(&format!("https://www.royalroad.com/fiction/{}", book.id)),
+                )
                 .await
             {
-                Ok(response) => response,
+                Ok(bytes) => bytes,
                 Err(e) => {
                     // Handle DNS and connection errors gracefully
                     tracing::warn!(
@@ -870,16 +973,6 @@ async fn download_image(book: &Book, url: String, file: &mut impl Write) -> eyre
                     return Ok(());
                 }
             };
-
-            if !image.status().is_success() {
-                tracing::warn!(
-                    "Failed to download image from URL (HTTP {}): {}. This is likely NOT a bug with rr-to-epub.",
-                    image.status(),
-                    url
-                );
-                return Ok(());
-            }
-            let bytes = image.bytes().await?;
 
             let image = if is_html(&bytes) {
                 // Skip HTML pages.
@@ -943,4 +1036,403 @@ async fn download_image(book: &Book, url: String, file: &mut impl Write) -> eyre
     }
 
     Ok(())
+}
+
+fn parse_chapters(response: &str) -> eyre::Result<Vec<Chapter>> {
+    let marker = "window.chapters = ";
+    let index = response
+        .find(marker)
+        .ok_or_else(|| eyre::eyre!("No chapters found"))?;
+    let mut deserializer = serde_json::Deserializer::from_str(&response[index + marker.len()..]);
+    let mut chapters = Vec::<Chapter>::deserialize(&mut deserializer)
+        .map_err(|err| eyre::eyre!("Failed to parse chapter list: {err}"))?;
+    for chapter in &mut chapters {
+        chapter.title = normalize_chapter_title(&chapter.title);
+    }
+    Ok(chapters)
+}
+
+pub fn normalize_chapter_title(title: &str) -> String {
+    title.trim().to_string()
+}
+
+fn text_of(document: &Html, selector: &str) -> Option<String> {
+    let selector = Selector::parse(selector).ok()?;
+    let text = document
+        .select(&selector)
+        .next()?
+        .text()
+        .collect::<String>();
+    let text = text.trim();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text.to_string())
+    }
+}
+
+fn html_of(document: &Html, selector: &str) -> Option<String> {
+    let selector = Selector::parse(selector).ok()?;
+    let html = document.select(&selector).next()?.inner_html();
+    if html.trim().is_empty() {
+        None
+    } else {
+        Some(html)
+    }
+}
+
+fn meta_content(document: &Html, property: &str) -> Option<String> {
+    let selector = Selector::parse(&format!(
+        r#"meta[property="{property}"], meta[name="{property}"]"#
+    ))
+    .ok()?;
+    let value = document
+        .select(&selector)
+        .next()?
+        .value()
+        .attr("content")?
+        .trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+fn json_ld_book(html: &str) -> Option<serde_json::Value> {
+    let re = Regex::new(r#"(?s)<script type="application/ld\+json">(.*?)</script>"#).unwrap();
+    for capture in re.captures_iter(html) {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&capture[1]) else {
+            continue;
+        };
+        if value.get("@type").and_then(|kind| kind.as_str()) == Some("Book") {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn json_ld_string(value: &Option<serde_json::Value>, key: &str) -> Option<String> {
+    let text = value.as_ref()?.get(key)?.as_str()?.trim();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text.to_string())
+    }
+}
+
+pub fn cover_candidate_urls(url: &str) -> Vec<String> {
+    const VARIANTS: &[&str] = &[
+        "covers-thumbnail",
+        "covers-full",
+        "covers-large",
+        "covers-small",
+    ];
+    let mut urls = Vec::new();
+    if let Some(large) = rewrite_cover_variant(url, VARIANTS, "covers-large") {
+        urls.push(large);
+    }
+    if !urls.iter().any(|candidate| candidate == url) {
+        urls.push(url.to_string());
+    }
+    urls
+}
+
+fn rewrite_cover_variant(url: &str, variants: &[&str], target: &str) -> Option<String> {
+    for variant in variants {
+        let needle = format!("/{variant}/");
+        if let Some(start) = url.find(&needle) {
+            let mut rewritten = String::new();
+            rewritten.push_str(&url[..start]);
+            rewritten.push('/');
+            rewritten.push_str(target);
+            rewritten.push('/');
+            rewritten.push_str(&url[start + needle.len()..]);
+            return Some(rewritten);
+        }
+    }
+    None
+}
+
+fn sniff_image_type(bytes: &[u8]) -> Option<&'static str> {
+    if is_png(bytes) {
+        Some("image/png")
+    } else if is_jpeg(bytes) {
+        Some("image/jpeg")
+    } else if is_gif(bytes) {
+        Some("image/gif")
+    } else {
+        None
+    }
+}
+
+fn normalize_cover(bytes: Vec<u8>) -> eyre::Result<(Vec<u8>, &'static str)> {
+    if let Some(media_type) = sniff_image_type(&bytes) {
+        return Ok((bytes, media_type));
+    }
+    if is_webp(&bytes) {
+        let image = Decoder::new(&bytes)
+            .decode()
+            .ok_or_else(|| eyre::eyre!("Failed to decode cover webp"))?
+            .to_image();
+        let mut buffer = Vec::new();
+        image.write_with_encoder(PngEncoder::new(Cursor::new(&mut buffer)))?;
+        return Ok((buffer, "image/png"));
+    }
+    bail!("Unsupported cover image format");
+}
+
+struct ChapterParts {
+    content: String,
+    authors_note_start: Option<String>,
+    authors_note_end: Option<String>,
+}
+
+fn extract_chapter_parts(html: &str) -> eyre::Result<ChapterParts> {
+    let parsed = Html::parse_document(html);
+    let content_selector = Selector::parse(".chapter-inner.chapter-content").unwrap();
+    let not_stolen_selector = Selector::parse(":scope > :not(div[class])").unwrap();
+    let note_selector = Selector::parse(".author-note").unwrap();
+    let content_el = parsed
+        .select(&content_selector)
+        .next()
+        .ok_or_else(|| eyre::eyre!("No chapter content found"))?;
+    let content_html = content_el
+        .select(&not_stolen_selector)
+        .map(|element| element.html())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let hidden = hidden_classes(html);
+    let content = strip_piracy(&content_html, &hidden);
+    let mut start_notes = Vec::new();
+    let mut end_notes = Vec::new();
+    for note in parsed.select(&note_selector) {
+        let text: String = note.text().collect();
+        if text.trim().is_empty() {
+            continue;
+        }
+        let cleaned = strip_piracy(&note.inner_html(), &hidden);
+        if element_is_before(&parsed, note, content_el) {
+            start_notes.push(cleaned);
+        } else {
+            end_notes.push(cleaned);
+        }
+    }
+    Ok(ChapterParts {
+        content,
+        authors_note_start: join_notes(start_notes),
+        authors_note_end: join_notes(end_notes),
+    })
+}
+
+fn element_is_before(
+    document: &Html,
+    earlier: scraper::ElementRef,
+    later: scraper::ElementRef,
+) -> bool {
+    for node in document.tree.root().descendants() {
+        if node.id() == earlier.id() {
+            return true;
+        }
+        if node.id() == later.id() {
+            return false;
+        }
+    }
+    false
+}
+
+fn join_notes(notes: Vec<String>) -> Option<String> {
+    let notes: Vec<String> = notes
+        .into_iter()
+        .filter(|note| !note.trim().is_empty())
+        .collect();
+    if notes.is_empty() {
+        None
+    } else {
+        Some(notes.join("\n"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        cover_candidate_urls, extract_chapter_parts, normalize_chapter_title, write_epub, Book,
+        Chapter,
+    };
+    use image::ImageEncoder;
+    use std::io::{Cursor, Read};
+
+    #[test]
+    fn trims_titles_with_leading_space() {
+        assert_eq!(
+            normalize_chapter_title(" Chapter 144 – Work. "),
+            "Chapter 144 – Work."
+        );
+    }
+
+    #[test]
+    fn cover_candidates_prefer_the_large_variant() {
+        let large =
+            "https://www.royalroadcdn.com/public/covers-large/33844-the-runesmith.jpg?time=1";
+        assert_eq!(cover_candidate_urls(large), vec![large.to_string()]);
+
+        let full = "https://www.royalroadcdn.com/public/covers-full/33844-the-runesmith.jpg?time=1";
+        assert_eq!(
+            cover_candidate_urls(full),
+            vec![
+                "https://www.royalroadcdn.com/public/covers-large/33844-the-runesmith.jpg?time=1"
+                    .to_string(),
+                full.to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn chapter_html_keeps_formatting_notes_and_drops_piracy_lines() {
+        let class = "cjFmMDUwYWM0NzExZjQ2Yjg4MThhZDk3NGY2OGNjNDFh";
+        let html = format!(
+            r#"<html><head><style>.{class} {{ display: none; speak: never; }}</style></head><body>
+            <div class="portlet solid author-note-portlet"><div class="portlet-body author-note"><p>Start note here.</p></div></div>
+            <div class="chapter-inner chapter-content">
+                <p class="cnNkYWMwMzBkOGYxODRiZDJhYzA1MmM2NTNjMmE3Yjk4">Hello <em>italic</em> and <strong>bold</strong> and <i>slant</i> and <b>weight</b>.</p>
+                <p class="{class}">A case of theft: this story is not rightfully on Amazon; if you spot it, report the violation.</p>
+                <span class="cmMxOGViZDM1ZmMxZDQyMjFhYWExZmYyNjMxZTY5OTU0"><br>You could be reading stolen content. Head to Royal Road for the genuine story.<br></span>
+                <div class="advert">Advertisement</div>
+                <p>After the interlude.</p>
+            </div>
+            <div class="portlet solid author-note-portlet"><div class="portlet-body author-note"><p>Thanks for reading.</p></div></div>
+            </body></html>"#
+        );
+        let parts = extract_chapter_parts(&html).unwrap();
+        assert!(parts.content.contains("<em>italic</em>"));
+        assert!(parts.content.contains("<strong>bold</strong>"));
+        assert!(parts.content.contains("<i>slant</i>"));
+        assert!(parts.content.contains("<b>weight</b>"));
+        assert!(parts.content.contains("After the interlude."));
+        assert!(!parts.content.contains("case of theft"));
+        assert!(!parts.content.contains("stolen content"));
+        assert!(!parts.content.contains("Advertisement"));
+        assert_eq!(
+            parts.authors_note_start.as_deref(),
+            Some("<p>Start note here.</p>")
+        );
+        assert_eq!(
+            parts.authors_note_end.as_deref(),
+            Some("<p>Thanks for reading.</p>")
+        );
+    }
+
+    #[tokio::test]
+    async fn epub_has_a_spine_entry_cover_and_note_per_chapter() {
+        let png = tiny_png();
+        let book = Book {
+            id: 33844,
+            title: "The Runesmith (Ch 672-673)".to_string(),
+            author: "Kuropon".to_string(),
+            description: "A story.".to_string(),
+            date_published: "2026-10-30T08:58:17Z".to_string(),
+            cover_url: "https://www.royalroadcdn.com/public/covers-large/33844.jpg".to_string(),
+            cover: Some(png.clone()),
+            cover_media_type: "image/png".to_string(),
+            chapters: vec![
+                Chapter {
+                    id: 3402749,
+                    title: "Chapter 672 – First Apprentice Acquired.".to_string(),
+                    content: Some(
+                        r#"<p>Hello <em>italic</em> and <strong>bold</strong>.</p><span class="cmMxOGViZDM1ZmMxZDQyMjFhYWExZmYyNjMxZTY5OTU0"><br>You could be reading stolen content. Head to Royal Road for the genuine story.<br></span>"#
+                            .to_string(),
+                    ),
+                    authors_note_end: Some("<p>Thanks for reading.</p>".to_string()),
+                    ..Chapter::default()
+                },
+                Chapter {
+                    id: 3417326,
+                    title: "Chapter 673 – Too Many Portals.".to_string(),
+                    content: Some("<p>Next.</p>".to_string()),
+                    authors_note_start: Some("<p>Before.</p>".to_string()),
+                    ..Chapter::default()
+                },
+            ],
+            range_start_id: Some(3402749),
+            range_end_id: Some(3417326),
+            range_end_latest: false,
+            ..Book::default()
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("slice.epub");
+        write_epub(&book, Some(path.to_string_lossy().into_owned()))
+            .await
+            .unwrap();
+
+        let file = std::fs::File::open(&path).unwrap();
+        let mut archive = zip::ZipArchive::new(file).unwrap();
+        let mut opf = String::new();
+        archive
+            .by_name("OEBPS/content.opf")
+            .unwrap()
+            .read_to_string(&mut opf)
+            .unwrap();
+        assert!(opf.contains("The Runesmith (Ch 672-673)"));
+        assert!(opf.contains(r#"properties="cover-image""#));
+        assert!(opf.contains("images/cover.png"));
+        assert!(opf.contains("image/png"));
+        assert!(opf.contains(r#"idref="ch-3402749""#));
+        assert!(opf.contains(r#"idref="ch-3417326""#));
+        assert!(opf.contains(r#"rr-to-epub:range-start-id" content="3402749""#));
+        assert!(opf.contains(r#"rr-to-epub:range-end-id" content="3417326""#));
+        let mut reader = xml::EventReader::new(opf.as_bytes());
+        loop {
+            match reader.next() {
+                Ok(xml::reader::XmlEvent::EndDocument) => break,
+                Ok(_) => {}
+                Err(err) => panic!("content.opf is not well-formed XML: {err}"),
+            }
+        }
+
+        let mut ncx = String::new();
+        archive
+            .by_name("OEBPS/toc.ncx")
+            .unwrap()
+            .read_to_string(&mut ncx)
+            .unwrap();
+        assert!(ncx.contains("Chapter 672 – First Apprentice Acquired."));
+        assert!(ncx.contains("Chapter 673 – Too Many Portals."));
+        assert_eq!(ncx.matches("<navPoint").count(), 3);
+
+        let mut chapter = String::new();
+        archive
+            .by_name("OEBPS/text/3402749.xhtml")
+            .unwrap()
+            .read_to_string(&mut chapter)
+            .unwrap();
+        assert!(chapter.contains("<em>italic</em>"));
+        assert!(chapter.contains("<strong>bold</strong>"));
+        assert!(chapter.contains("Author's Note"));
+        assert!(chapter.contains(r#"role="note""#));
+        assert!(chapter.contains("Thanks for reading."));
+        assert!(!chapter.contains("stolen content"));
+
+        let mut cover = Vec::new();
+        archive
+            .by_name("OEBPS/images/cover.png")
+            .unwrap()
+            .read_to_end(&mut cover)
+            .unwrap();
+        assert_eq!(cover, png);
+
+        let origin = Book::origin_from_file(&path).unwrap();
+        assert_eq!(origin.id, Some(33844));
+        assert_eq!(origin.range.from.as_deref(), Some("id:3402749"));
+        assert_eq!(origin.range.to.as_deref(), Some("id:3417326"));
+    }
+
+    fn tiny_png() -> Vec<u8> {
+        let image = image::RgbImage::from_pixel(2, 2, image::Rgb([12, 34, 56]));
+        let mut buffer = Vec::new();
+        image::codecs::png::PngEncoder::new(Cursor::new(&mut buffer))
+            .write_image(image.as_raw(), 2, 2, image::ColorType::Rgb8)
+            .unwrap();
+        buffer
+    }
 }

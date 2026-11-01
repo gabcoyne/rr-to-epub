@@ -46,3 +46,9 @@ cover {
 	font-style: italic;
 	font-size: 0.8em;
 }
+.authors-note-label {
+	font-style: normal;
+	font-weight: bold;
+	letter-spacing: 0.04em;
+	margin-bottom: 0.4em;
+}
