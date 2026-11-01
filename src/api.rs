@@ -1,63 +1,93 @@
-use crate::{cache::Cache, epub::Book};
+use crate::cache::Cache;
+use crate::epub::Book;
+use crate::http::HttpClient;
+use crate::range::{ranged_title, RangeRequest};
 
-pub struct RoyalRoadApi;
+pub struct RoyalRoadApi {
+    client: HttpClient,
+}
 
 impl RoyalRoadApi {
-    pub fn new() -> Self {
-        Self
+    pub fn new() -> eyre::Result<Self> {
+        Ok(Self {
+            client: HttpClient::new()?,
+        })
     }
-    pub async fn get_book(&self, id: u32, ignore_cache: bool) -> eyre::Result<Book> {
-        // Do the initial metadata fetch of the book.
-        let mut book = Book::new(id).await?;
 
-        // Update the cover.
+    pub async fn get_book(
+        &self,
+        id: u32,
+        ignore_cache: bool,
+        range: &RangeRequest,
+    ) -> eyre::Result<Book> {
+        tracing::info!("Fetching fiction page for {id}.");
+        let mut book = Book::new(self.client.clone(), id).await?;
+        let total = book.chapters.len();
+        let resolved = range.resolve(
+            &book
+                .chapters
+                .iter()
+                .map(|chapter| chapter.id)
+                .collect::<Vec<_>>(),
+        )?;
+        tracing::info!(
+            "Chapter range: TOC {}-{} of {total}{}.",
+            resolved.start + 1,
+            resolved.end + 1,
+            if resolved.end_is_latest {
+                " (through latest)"
+            } else {
+                ""
+            }
+        );
+
         tracing::info!("Updating cover.");
         book.update_cover().await?;
 
-        // Check the cache.
-        let cached = Cache::read_book(id)?;
-        match cached {
-            Some(mut cached) => {
-                // Compare cached and fetched to see if any chapters are out-of-date.
-                let mut should_update = ignore_cache;
-                for chapter in book.chapters.iter() {
-                    if let Some(cached) = cached.chapters.iter().find(|c| c.url == chapter.url) {
-                        if cached.date != chapter.date {
-                            should_update = true;
-                            break;
+        if !ignore_cache {
+            if let Some(cached) = Cache::read_book(id)? {
+                for chapter in book.chapters.iter_mut() {
+                    if let Some(old) = cached
+                        .chapters
+                        .iter()
+                        .find(|cached| cached.id == chapter.id)
+                    {
+                        if old.date == chapter.date && old.content.is_some() {
+                            chapter.content = old.content.clone();
+                            chapter.authors_note_start = old.authors_note_start.clone();
+                            chapter.authors_note_end = old.authors_note_end.clone();
                         }
-                    } else {
-                        should_update = true;
-                        break;
                     }
                 }
-
-                if should_update {
-                    // There is at least one out-of-date chapter, update the chapters.
-                    book.update_chapter_content().await?;
-
-                    // Save back to cache.
-                    Cache::write_book(&book)?;
-
-                    Ok(book)
-                } else {
-                    // Just update the cover URL and resave to cache.
-                    cached.cover_url = book.cover_url;
-                    Cache::write_book(&cached)?;
-
-                    Ok(cached)
-                }
-            }
-            None => {
-                // Load book chapters.
-                book.update_chapter_content().await?;
-
-                // Write book to cache.
-                Cache::write_book(&book)?;
-
-                // Return book.
-                Ok(book)
             }
         }
+
+        book.update_chapter_content(resolved.start, resolved.end)
+            .await?;
+        Cache::write_book(&book)?;
+
+        let mut epub_book = book.clone();
+        epub_book.chapters = book.chapters[resolved.start..=resolved.end].to_vec();
+        if let Some(first) = epub_book.chapters.first() {
+            epub_book.date_published = first.date.clone();
+        }
+
+        let unrestricted = resolved.start == 0 && resolved.end_is_latest;
+        if unrestricted {
+            epub_book.range_start_id = None;
+            epub_book.range_end_id = None;
+            epub_book.range_end_latest = false;
+        } else {
+            epub_book.title = ranged_title(&book.title, resolved.start + 1, resolved.end + 1);
+            epub_book.range_start_id = epub_book.chapters.first().map(|chapter| chapter.id);
+            epub_book.range_end_latest = resolved.end_is_latest;
+            epub_book.range_end_id = if resolved.end_is_latest {
+                None
+            } else {
+                epub_book.chapters.last().map(|chapter| chapter.id)
+            };
+        }
+
+        Ok(epub_book)
     }
 }

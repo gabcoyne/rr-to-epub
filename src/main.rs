@@ -1,12 +1,16 @@
 use crate::api::RoyalRoadApi;
 use crate::epub::write_epub;
+use crate::range::RangeRequest;
 use clap::Parser;
 use epub::Book;
 use url::Url;
 
 mod api;
 mod cache;
+mod clean;
 mod epub;
+mod http;
+mod range;
 mod xml_ext;
 
 #[derive(Debug, Parser)]
@@ -22,6 +26,19 @@ pub struct DownloadArgs {
     #[arg(long = "book-url", short = 'u')]
     /// The URL of the book to download. One of --book-id or --book-url is required.
     pub book_url: Option<String>,
+
+    /// First chapter to include. A number is a 1-based TOC index (`672`).
+    /// `id:3402749` is a Royal Road chapter id. A chapter URL works too.
+    #[arg(long, value_name = "BOUND", conflicts_with = "after")]
+    pub from: Option<String>,
+
+    /// Last chapter to include, in the same forms as --from. Defaults to the latest chapter.
+    #[arg(long, value_name = "BOUND")]
+    pub to: Option<String>,
+
+    /// Start after this chapter (exclusive). Interludes between it and --to stay in TOC order.
+    #[arg(long, value_name = "BOUND", conflicts_with = "from")]
+    pub after: Option<String>,
 }
 
 #[derive(Debug, Parser)]
@@ -99,13 +116,18 @@ async fn download(global_args: GlobalArgs, args: DownloadArgs) -> eyre::Result<(
         }
     };
 
-    let api = RoyalRoadApi::new();
-    let book = api.get_book(id, global_args.ignore_cache).await?;
+    let api = RoyalRoadApi::new()?;
+    let range = RangeRequest {
+        from: args.from,
+        to: args.to,
+        after: args.after,
+    };
+    let book = api.get_book(id, global_args.ignore_cache, &range).await?;
     write_epub(&book, args.output_file).await?;
     Ok(())
 }
 async fn update(global_args: GlobalArgs, args: UpdateArgs) -> eyre::Result<()> {
-    let api = RoyalRoadApi::new();
+    let api = RoyalRoadApi::new()?;
     let Ok(stat) = std::fs::metadata(&args.folder_or_file) else {
         tracing::error!(
             "Folder or file \"{}\" does not exist, aborting.",
@@ -125,14 +147,7 @@ async fn update(global_args: GlobalArgs, args: UpdateArgs) -> eyre::Result<()> {
 
         let path = std::path::Path::new(&file_name);
         let path = path.canonicalize()?;
-        let id = Book::id_from_file(path)?;
-        if let Some(id) = id {
-            tracing::info!("Found book file \"{}\", updating.", file_name);
-            let book = api.get_book(id, global_args.ignore_cache).await?;
-            write_epub(&book, Some(file_name)).await?;
-        } else {
-            tracing::error!("Book file at \"{}\" is unmanaged, aborting.", file_name);
-        }
+        update_book(&api, &path, global_args.ignore_cache, Some(file_name)).await?;
     } else {
         let list = std::fs::read_dir(&args.folder_or_file)?;
         for file in list {
@@ -144,15 +159,34 @@ async fn update(global_args: GlobalArgs, args: UpdateArgs) -> eyre::Result<()> {
             if !file_name.ends_with(".epub") {
                 continue;
             }
-            let id = Book::id_from_file(file.path())?;
-            if let Some(id) = id {
-                tracing::info!("Found book file \"{}\", updating.", file_name);
-                let book = api.get_book(id, global_args.ignore_cache).await?;
-                write_epub(&book, Some(file_name)).await?;
-            } else {
-                tracing::warn!("Found unmanaged book file \"{}\", skipping.", file_name,);
-            }
+            update_book(
+                &api,
+                &file.path(),
+                global_args.ignore_cache,
+                Some(file.path().to_string_lossy().into_owned()),
+            )
+            .await?;
         }
     }
+    Ok(())
+}
+
+async fn update_book(
+    api: &RoyalRoadApi,
+    path: &std::path::Path,
+    ignore_cache: bool,
+    output: Option<String>,
+) -> eyre::Result<()> {
+    let origin = Book::origin_from_file(path)?;
+    let Some(id) = origin.id else {
+        tracing::warn!(
+            "Found unmanaged book file \"{}\", skipping.",
+            path.display()
+        );
+        return Ok(());
+    };
+    tracing::info!("Found book file \"{}\", updating.", path.display());
+    let book = api.get_book(id, ignore_cache, &origin.range).await?;
+    write_epub(&book, output).await?;
     Ok(())
 }
